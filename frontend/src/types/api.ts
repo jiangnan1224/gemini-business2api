@@ -3,6 +3,7 @@
 export interface QuotaStatus {
   available: boolean
   remaining_seconds?: number
+  reason?: string  // 受限原因（如"对话配额受限"）
 }
 
 export interface AccountQuotaStatus {
@@ -186,6 +187,8 @@ export interface AdminStatsTrend {
   failed_requests: number[]
   rate_limited_requests: number[]
   model_requests?: Record<string, number[]>
+  model_ttfb_times?: Record<string, number[]>
+  model_total_times?: Record<string, number[]>
 }
 
 export interface AdminStats {

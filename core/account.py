@@ -150,7 +150,7 @@ class AccountManager:
 
     def handle_non_http_error(self, error_context: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理非HTTP错误（网络错误、解析错误等）- 简化版：只有配额冷却
+        统一处理非HTTP错误（网络错误、解析错误等）- 按配额类型冷却
 
         Args:
             error_context: 错误上下文（如"JWT获取"、"聊天请求"）
@@ -186,7 +186,7 @@ class AccountManager:
 
     def handle_http_error(self, status_code: int, error_detail: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理HTTP错误 - 简化版：只有配额冷却
+        统一处理HTTP错误 - 按配额类型冷却
 
         Args:
             status_code: HTTP状态码
@@ -209,7 +209,6 @@ class AccountManager:
             return
 
         # 所有其他错误：按配额类型冷却（默认为对话配额）
-        # 如果没有指定配额类型，默认冷却对话配额（因为对话是基础）
         if not quota_type or quota_type not in QUOTA_TYPES:
             quota_type = "text"
 
@@ -522,7 +521,43 @@ class MultiAccountManager:
             manager.failure_count = global_stats["account_failures"].get(config.account_id, 0)
         self.accounts[config.account_id] = manager
         self.account_list.append(config.account_id)
-        logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
+        logger.debug(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
+
+    def get_available_accounts(
+        self,
+        required_quota_types: Optional[Iterable[str]] = None
+    ) -> List[AccountManager]:
+        """获取可用账户列表（过滤掉禁用、过期、冷却中的账户）
+
+        Args:
+            required_quota_types: 需要的配额类型列表（如 ["text"], ["images"], ["text", "videos"]）
+
+        Returns:
+            可用账户列表
+
+        过滤规则：
+            1. disabled=True → 跳过（手动禁用）
+            2. is_expired() → 跳过（账户过期）
+            3. are_quotas_available() → 跳过（配额冷却中）
+        """
+        available = []
+
+        for acc in self.accounts.values():
+            # 1. 检查手动禁用
+            if acc.config.disabled:
+                continue
+
+            # 2. 检查账户过期
+            if acc.config.is_expired():
+                continue
+
+            # 3. 检查配额可用性（包括冷却检查）
+            if not acc.are_quotas_available(required_quota_types):
+                continue
+
+            available.append(acc)
+
+        return available
 
     async def get_account(
         self,
@@ -530,7 +565,20 @@ class MultiAccountManager:
         request_id: str = "",
         required_quota_types: Optional[Iterable[str]] = None
     ) -> AccountManager:
-        """获取账户 - Round-Robin轮询"""
+        """获取账户 - Round-Robin轮询
+
+        Args:
+            account_id: 指定账户ID（可选，如果指定则直接返回该账户）
+            request_id: 请求ID（用于日志）
+            required_quota_types: 需要的配额类型列表
+
+        Returns:
+            可用的账户管理器
+
+        Raises:
+            HTTPException(404): 指定的账户不存在
+            HTTPException(503): 没有可用账户
+        """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
         # 指定账户ID时直接返回
@@ -544,14 +592,8 @@ class MultiAccountManager:
                 raise HTTPException(503, f"Account {account_id} quota temporarily unavailable")
             return account
 
-        # 筛选可用账户
-        available_accounts = [
-            acc for acc in self.accounts.values()
-            if (acc.should_retry() and
-                not acc.config.is_expired() and
-                not acc.config.disabled and
-                acc.are_quotas_available(required_quota_types))
-        ]
+        # 获取可用账户列表
+        available_accounts = self.get_available_accounts(required_quota_types)
 
         if not available_accounts:
             raise HTTPException(503, "No available accounts")
@@ -668,9 +710,19 @@ def load_multi_account_config(
         # 检查账户是否已过期（已过期也加载到管理面板）
         is_expired = config.is_expired()
         if is_expired:
-            logger.warning(f"[CONFIG] 账户 {config.account_id} 已过期，仍加载用于展示")
+            logger.debug(f"[CONFIG] 账户 {config.account_id} 已过期，仍加载用于展示")
 
         manager.add_account(config, http_client, user_agent, retry_policy, global_stats)
+
+        # 从数据库恢复冷却状态和统计数据
+        account_mgr = manager.accounts[config.account_id]
+        if "quota_cooldowns" in acc:
+            account_mgr.quota_cooldowns = dict(acc["quota_cooldowns"])
+        if "conversation_count" in acc:
+            account_mgr.conversation_count = int(acc.get("conversation_count", 0))
+        if "failure_count" in acc:
+            account_mgr.failure_count = int(acc.get("failure_count", 0))
+
         if is_expired:
             manager.accounts[config.account_id].is_available = False
 
@@ -928,3 +980,71 @@ def bulk_delete_accounts(
     success_count = len(deleted_ids)
     logger.info(f"[CONFIG] 批量删除 {success_count}/{len(account_ids)} 个账户")
     return multi_account_mgr, success_count, errors
+
+
+async def save_account_cooldown_state(account_id: str, account_mgr: AccountManager) -> bool:
+    """保存单个账户的冷却状态到数据库（优化版：单条更新）"""
+    if not storage.is_database_enabled():
+        return False
+
+    try:
+        cooldown_data = {
+            "quota_cooldowns": dict(account_mgr.quota_cooldowns),
+            "conversation_count": account_mgr.conversation_count,
+            "failure_count": account_mgr.failure_count,
+        }
+
+        success = await storage.update_account_cooldown(account_id, cooldown_data)
+        if success:
+            logger.debug(f"[COOLDOWN] 账户 {account_id} 冷却状态已保存")
+        else:
+            logger.warning(f"[COOLDOWN] 账户 {account_id} 不存在")
+        return success
+    except Exception as e:
+        logger.error(f"[COOLDOWN] 保存账户 {account_id} 冷却状态失败: {e}")
+        return False
+
+
+def save_account_cooldown_state_sync(account_id: str, account_mgr: AccountManager) -> bool:
+    """保存单个账户的冷却状态到数据库（同步版本）"""
+    try:
+        return asyncio.run(save_account_cooldown_state(account_id, account_mgr))
+    except Exception as e:
+        logger.error(f"[COOLDOWN] 同步保存账户 {account_id} 冷却状态失败: {e}")
+        return False
+
+
+async def save_all_cooldown_states(multi_account_mgr: MultiAccountManager) -> int:
+    """保存有冷却状态的账户到数据库（优化版：批量更新）"""
+    if not storage.is_database_enabled():
+        return 0
+
+    # 收集需要保存的账户
+    updates = []
+    for account_id, account_mgr in multi_account_mgr.accounts.items():
+        has_cooldown = (
+            account_mgr.quota_cooldowns or
+            account_mgr.conversation_count > 0 or
+            account_mgr.failure_count > 0
+        )
+
+        if has_cooldown:
+            cooldown_data = {
+                "quota_cooldowns": dict(account_mgr.quota_cooldowns),
+                "conversation_count": account_mgr.conversation_count,
+                "failure_count": account_mgr.failure_count,
+            }
+            updates.append((account_id, cooldown_data))
+
+    if not updates:
+        logger.info(f"[COOLDOWN] 无需保存：所有账户无冷却状态")
+        return 0
+
+    success_count, missing = await storage.bulk_update_accounts_cooldown(updates)
+
+    if missing:
+        logger.warning(f"[COOLDOWN] {len(missing)} 个账户不存在: {missing[:5]}")
+
+    logger.info(f"[COOLDOWN] 批量保存冷却状态: {success_count}/{len(updates)} 个账户（跳过 {len(multi_account_mgr.accounts) - len(updates)} 个无状态账户）")
+    return success_count
+

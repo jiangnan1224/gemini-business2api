@@ -15,8 +15,8 @@ from typing import Optional
 
 import requests
 
-from core.mail_utils import extract_verification_code
-from core.proxy_utils import request_with_proxy_fallback
+from worker.mail_utils import extract_verification_code
+from worker.proxy_utils import request_with_proxy_fallback
 
 
 class MoemailClient:
@@ -102,17 +102,12 @@ class MoemailClient:
         return self._available_domains
 
     def register_account(self, domain: Optional[str] = None) -> bool:
-        """注册新邮箱账号
-
-        API: POST /api/emails/generate
-        """
-        # 确定使用的域名
+        """注册新邮箱账号"""
         selected_domain = domain
         if not selected_domain:
             selected_domain = self.domain
 
         if not selected_domain:
-            # 从可用域名中随机选择
             available = self._get_available_domains()
             if available:
                 selected_domain = random.choice(available)
@@ -121,7 +116,6 @@ class MoemailClient:
 
         self._log("info", f"📧 使用域名: {selected_domain}")
 
-        # 生成随机邮箱名称
         rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
         timestamp = str(int(time.time()))[-4:]
         name = f"t{timestamp}{rand}"
@@ -129,7 +123,6 @@ class MoemailClient:
         self._log("info", f"🎲 生成邮箱: {name}@{selected_domain}")
 
         try:
-            # 设置为 0 表示永久有效
             self._log("info", f"⏰ 设置过期时间: 永久有效")
 
             res = self._request(
@@ -164,15 +157,10 @@ class MoemailClient:
 
     def login(self) -> bool:
         """登录（Moemail 无需登录，返回 True）"""
-        # Moemail 使用 API Key 认证，无需单独登录
         return True
 
     def fetch_verification_code(self, since_time=None) -> Optional[str]:
-        """获取验证码
-
-        API: GET /api/emails/{emailId}
-        API: GET /api/emails/{emailId}/{messageId}
-        """
+        """获取验证码"""
         if not self.email_id:
             self._log("error", "❌ 缺少 email_id，无法获取邮件")
             return None
@@ -180,7 +168,6 @@ class MoemailClient:
         try:
             self._log("info", "📬 正在拉取 Moemail 邮件列表...")
 
-            # 获取邮件列表
             res = self._request(
                 "GET",
                 f"{self.base_url}/api/emails/{self.email_id}",
@@ -235,9 +222,7 @@ class MoemailClient:
                             timestamp = timestamp / 1000.0
                         return datetime.fromtimestamp(timestamp)
 
-                    # 处理 ISO 时间字符串
                     try:
-                        # 截断纳秒到微秒
                         raw_time = re.sub(r"(\.\d{6})\d+", r"\1", raw_time)
                         return datetime.fromisoformat(raw_time.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
                     except Exception:
@@ -257,13 +242,11 @@ class MoemailClient:
                 messages_with_time.sort(key=lambda item: item[1] or datetime.min, reverse=True)
                 messages = [item[0] for item in messages_with_time]
 
-            # 遍历邮件
             for idx, msg in enumerate(messages, 1):
                 msg_id = msg.get("id")
                 if not msg_id:
                     continue
 
-                # 时间过滤
                 if since_time:
                     msg_time = _parse_message_time(msg)
                     if msg_time:
@@ -273,7 +256,6 @@ class MoemailClient:
                     if not _looks_like_verification(msg):
                         continue
 
-                # 优先从邮件列表的 content 字段提取验证码（更高效）
                 list_content = msg.get("content") or ""
                 if list_content:
                     code = extract_verification_code(list_content)
@@ -281,7 +263,6 @@ class MoemailClient:
                         self._log("info", f"✅ 找到验证码: {code}")
                         return code
 
-                # 如果列表没有 content，则获取邮件详情
                 self._log("info", f"🔍 正在读取邮件 {idx}/{len(messages)} 详情...")
                 detail_res = self._request(
                     "GET",
@@ -294,11 +275,9 @@ class MoemailClient:
 
                 detail = detail_res.json() if detail_res.content else {}
 
-                # 处理 {'message': {...}} 格式
                 if "message" in detail and isinstance(detail["message"], dict):
                     detail = detail["message"]
 
-                # 获取邮件内容
                 text_content = detail.get("text") or detail.get("textContent") or detail.get("content") or ""
                 html_content = detail.get("html") or detail.get("htmlContent") or ""
 

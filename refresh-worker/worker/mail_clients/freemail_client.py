@@ -5,8 +5,8 @@ from typing import Optional
 
 import requests
 
-from core.mail_utils import extract_verification_code
-from core.proxy_utils import request_with_proxy_fallback
+from worker.mail_utils import extract_verification_code
+from worker.proxy_utils import request_with_proxy_fallback
 
 
 class FreemailClient:
@@ -77,7 +77,6 @@ class FreemailClient:
 
             if res.status_code in (200, 201):
                 data = res.json() if res.content else {}
-                # Freemail API 返回的字段是 "email" 或 "mailbox"
                 email = data.get("email") or data.get("mailbox")
                 if email:
                     self.email = email
@@ -177,7 +176,6 @@ class FreemailClient:
                             timestamp = timestamp / 1000.0
                         return datetime.fromtimestamp(timestamp).astimezone().replace(tzinfo=None)
 
-                    # 截断纳秒到微秒（fromisoformat 只支持6位小数）
                     raw = re.sub(r"(\.\d{6})\d+", r"\1", raw)
 
                     try:
@@ -190,7 +188,6 @@ class FreemailClient:
 
                 return None
 
-            # 按时间倒序，优先检查最新邮件
             emails_with_time = [(email_item, _parse_email_time(email_item)) for email_item in emails]
             if any(item[1] is not None for item in emails_with_time):
                 emails_with_time.sort(key=lambda item: item[1] or datetime.min, reverse=True)
@@ -199,7 +196,7 @@ class FreemailClient:
             skipped_no_time_indexes = []
             skipped_expired_indexes = []
 
-            def _format_indexes(indexes: list[int]) -> str:
+            def _format_indexes(indexes: list) -> str:
                 if len(indexes) <= 10:
                     return ",".join(str(index) for index in indexes)
                 preview = ",".join(str(index) for index in indexes[:10])
@@ -219,9 +216,7 @@ class FreemailClient:
                         f"（序号: {_format_indexes(skipped_expired_indexes)}）",
                     )
 
-            # 从最新一封邮件开始查找
             for idx, email_data in enumerate(emails, 1):
-                # 时间过滤
                 if since_time:
                     email_time = _parse_email_time(email_data)
                     if email_time is None:
@@ -231,10 +226,8 @@ class FreemailClient:
                         skipped_expired_indexes.append(idx)
                         continue
 
-                # 获取邮件完整内容
                 email_id = email_data.get("id")
                 if email_id:
-                    # 调用详情接口获取完整内容
                     detail_res = self._request(
                         "GET",
                         f"{self.base_url}/api/email/{email_id}",
@@ -245,13 +238,11 @@ class FreemailClient:
                         content = detail_data.get("content") or ""
                         html_content = detail_data.get("html_content") or ""
                     else:
-                        # 降级：如果详情接口失败，使用列表中的字段
                         content = email_data.get("content") or ""
                         html_content = email_data.get("html_content") or ""
                         preview = email_data.get("preview") or ""
                         content = content + " " + preview
                 else:
-                    # 降级：没有 ID，使用列表中的字段
                     content = email_data.get("content") or ""
                     html_content = email_data.get("html_content") or ""
                     preview = email_data.get("preview") or ""

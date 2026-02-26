@@ -62,6 +62,7 @@ class AccountConfig:
     mail_verify_ssl: Optional[bool] = None
     mail_domain: Optional[str] = None
     mail_api_key: Optional[str] = None
+    trial_end: Optional[str] = None  # 试用到期日 (格式: "2026-03-25"，独立于cookie过期)
 
     def get_remaining_hours(self) -> Optional[float]:
         """计算账户剩余小时数"""
@@ -88,6 +89,20 @@ class AccountConfig:
         if remaining is None:
             return False  # 未设置过期时间，默认不过期
         return remaining <= 0
+
+    def get_trial_days_remaining(self) -> Optional[int]:
+        """计算试用期剩余天数（基于 trial_end 字段）"""
+        if not self.trial_end:
+            return None
+        try:
+            beijing_tz = timezone(timedelta(hours=8))
+            end_date = datetime.strptime(self.trial_end, "%Y-%m-%d")
+            end_date = end_date.replace(tzinfo=beijing_tz)
+            now = datetime.now(beijing_tz)
+            remaining = (end_date.date() - now.date()).days
+            return max(0, remaining)
+        except Exception:
+            return None
 
 
 @dataclass(frozen=True)
@@ -144,30 +159,30 @@ class AccountManager:
         self.is_available = True
         self.last_error_time = 0.0  # 保留用于统计
         self.quota_cooldowns: Dict[str, float] = {}  # 按配额类型的冷却时间戳
+        self.daily_usage: Dict[str, int] = {"text": 0, "images": 0, "videos": 0}  # 每日使用计数
+        self.daily_usage_date: str = ""  # 计数日期（北京时间，格式 "2026-02-24"）
         self.conversation_count = 0  # 累计成功次数（用于统计展示）
         self.failure_count = 0  # 累计失败次数（用于统计展示）
         self.session_usage_count = 0  # 本次启动后使用次数（用于均衡轮询）
 
     def handle_non_http_error(self, error_context: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理非HTTP错误（网络错误、解析错误等）- 按配额类型冷却
+        统一处理非HTTP错误（网络错误、解析错误等）- 只记录日志，不触发冷却
 
         Args:
             error_context: 错误上下文（如"JWT获取"、"聊天请求"）
             request_id: 请求ID（用于日志）
-            quota_type: 配额类型（"text", "images", "videos"），用于按类型冷却
+            quota_type: 配额类型（保留参数以保持接口兼容性）
+
+        注意：网络错误、超时等是临时问题，应该直接切换账户重试，不标记配额冷却
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
-        # 如果没有指定配额类型，默认冷却对话配额（因为对话是基础）
-        if not quota_type or quota_type not in QUOTA_TYPES:
-            quota_type = "text"
-
-        self.quota_cooldowns[quota_type] = time.time()
-        cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+        # 只记录日志，不触发冷却
+        # 网络错误是临时的，应该直接切换账户重试
         logger.warning(
             f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-            f"{error_context}失败，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+            f"{error_context}失败，将切换账户重试（不触发冷却）"
         )
 
     def _get_quota_cooldown_seconds(self, quota_type: Optional[str]) -> int:
@@ -184,9 +199,34 @@ class AccountManager:
         self.images_rate_limit_cooldown_seconds = retry_policy.cooldowns.images
         self.videos_rate_limit_cooldown_seconds = retry_policy.cooldowns.videos
 
+    def _get_quota_period(self) -> str:
+        """获取当前配额周期标识（北京时间16:00为分界，对齐Google太平洋时间午夜重置）"""
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        # 16:00前属于前一天的配额周期，16:00后属于当天的配额周期
+        if now.hour < 16:
+            period_date = now.date() - timedelta(days=1)
+        else:
+            period_date = now.date()
+        return period_date.strftime("%Y-%m-%d")
+
+    def _reset_daily_usage_if_needed(self) -> None:
+        """跨配额周期自动重置每日计数器（懒重置，北京时间16:00刷新）"""
+        period = self._get_quota_period()
+        if self.daily_usage_date != period:
+            self.daily_usage = {"text": 0, "images": 0, "videos": 0}
+            self.daily_usage_date = period
+
+    def increment_daily_usage(self, quota_type: str) -> None:
+        """请求成功后增加每日使用计数"""
+        if quota_type not in QUOTA_TYPES:
+            return
+        self._reset_daily_usage_if_needed()
+        self.daily_usage[quota_type] += 1
+
     def handle_http_error(self, status_code: int, error_detail: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理HTTP错误 - 按配额类型冷却
+        统一处理HTTP错误 - 按错误类型分类处理
 
         Args:
             status_code: HTTP状态码
@@ -196,7 +236,9 @@ class AccountManager:
 
         处理逻辑：
             - 400: 参数错误，不计入失败（客户端问题）
-            - 所有其他错误: 按配额类型冷却（默认为对话配额）
+            - 401/403: 认证错误，冷却 text 配额（等效冷却整个账户）
+            - 429: 按配额类型冷却（配额耗尽）
+            - 502/503/504/其他: 只记录日志，不触发冷却（临时服务器错误，应直接切换账户重试）
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
@@ -208,24 +250,56 @@ class AccountManager:
             )
             return
 
-        # 所有其他错误：按配额类型冷却（默认为对话配额）
-        if not quota_type or quota_type not in QUOTA_TYPES:
-            quota_type = "text"
+        # 401/403认证错误：冷却 text 配额（等效冷却整个账户，但可自动恢复）
+        if status_code in (401, 403):
+            self.quota_cooldowns["text"] = time.time()
+            cooldown_seconds = self.text_rate_limit_cooldown_seconds
+            error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到{error_type}认证错误，账户将休息{cooldown_seconds}秒后自动恢复"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
 
-        self.quota_cooldowns[quota_type] = time.time()
-        cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+        # 429配额错误：按配额类型冷却
+        if status_code == 429:
+            if not quota_type or quota_type not in QUOTA_TYPES:
+                quota_type = "text"
+
+            self.quota_cooldowns[quota_type] = time.time()
+            cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到429配额错误，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
+
+        # 502/503/504/其他错误：只记录日志，不触发冷却
+        # 这些是临时服务器错误，应该直接重试切换账户，不标记配额
         error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
         logger.warning(
             f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-            f"遇到{error_type}错误，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+            f"遇到{error_type}错误，将切换账户重试（不触发冷却）"
             f"{': ' + error_detail[:100] if error_detail else ''}"
         )
 
     def is_quota_available(self, quota_type: str) -> bool:
-        """检查指定配额是否可用（冷却中则不可用）。"""
+        """检查指定配额是否可用（先检查每日上限，再检查冷却）。"""
         if quota_type not in QUOTA_TYPES:
             return True
 
+        # 主动配额计数检查
+        from core.config import config
+        quota_limits = config.quota_limits
+        if quota_limits.enabled:
+            self._reset_daily_usage_if_needed()
+            limit = getattr(quota_limits, f"{quota_type}_daily_limit", 0)
+            if limit > 0 and self.daily_usage.get(quota_type, 0) >= limit:
+                return False
+
+        # 被动冷却检查（兜底）
         cooldown_time = self.quota_cooldowns.get(quota_type)
         if not cooldown_time:
             return True
@@ -328,20 +402,24 @@ class AccountManager:
 
     def get_quota_status(self) -> Dict[str, any]:
         """
-        获取配额状态（被动检测模式）
+        获取配额状态（被动检测 + 主动计数）
 
         Returns:
             {
                 "quotas": {
-                    "text": {"available": bool, "remaining_seconds": int},
-                    "images": {"available": bool, "remaining_seconds": int},
-                    "videos": {"available": bool, "remaining_seconds": int}
+                    "text": {"available": bool, "remaining_seconds": int, "daily_used": int, "daily_limit": int},
+                    "images": {"available": bool, "remaining_seconds": int, "daily_used": int, "daily_limit": int},
+                    "videos": {"available": bool, "remaining_seconds": int, "daily_used": int, "daily_limit": int}
                 },
                 "limited_count": int,  # 受限配额数量
                 "total_count": int,    # 总配额数量
                 "is_expired": bool     # 账户是否过期/禁用
             }
         """
+        # 获取配额上限配置
+        from core.config import config as app_config
+        quota_limits = app_config.quota_limits
+
         # 检查账户是否过期或被禁用
         is_expired = self.config.is_expired() or self.config.disabled
         if is_expired:
@@ -355,6 +433,7 @@ class AccountManager:
             }
 
         current_time = time.time()
+        self._reset_daily_usage_if_needed()
 
         quotas = {}
         limited_count = 0
@@ -363,28 +442,43 @@ class AccountManager:
 
         # 第一遍：检查所有配额状态
         for quota_type in QUOTA_TYPES:
+            quota_info: Dict[str, any] = {}
+
+            # 添加每日使用量信息
+            if quota_limits.enabled:
+                daily_limit = getattr(quota_limits, f"{quota_type}_daily_limit", 0)
+                quota_info["daily_used"] = self.daily_usage.get(quota_type, 0)
+                quota_info["daily_limit"] = daily_limit
+
+                # 检查每日上限
+                if daily_limit > 0 and quota_info["daily_used"] >= daily_limit:
+                    quota_info["available"] = False
+                    quota_info["reason"] = "每日配额已用完"
+                    limited_count += 1
+                    if quota_type == "text":
+                        text_limited = True
+                    quotas[quota_type] = quota_info
+                    continue
+
+            # 检查被动冷却
             if quota_type in self.quota_cooldowns:
                 cooldown_time = self.quota_cooldowns[quota_type]
-                # 检查冷却时间是否已过（按配额类型）
                 elapsed = current_time - cooldown_time
                 cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
                 if elapsed < cooldown_seconds:
                     remaining = int(cooldown_seconds - elapsed)
-                    quotas[quota_type] = {
-                        "available": False,
-                        "remaining_seconds": remaining
-                    }
+                    quota_info["available"] = False
+                    quota_info["remaining_seconds"] = remaining
                     limited_count += 1
-                    # 标记对话配额受限
                     if quota_type == "text":
                         text_limited = True
+                    quotas[quota_type] = quota_info
+                    continue
                 else:
-                    # 冷却时间已过，标记为待删除
                     expired_quotas.append(quota_type)
-                    quotas[quota_type] = {"available": True}
-            else:
-                # 未检测到限流
-                quotas[quota_type] = {"available": True}
+
+            quota_info["available"] = True
+            quotas[quota_type] = quota_info
 
         # 统一删除已过期的配额冷却
         for quota_type in expired_quotas:
@@ -394,10 +488,8 @@ class AccountManager:
         if text_limited:
             for quota_type in QUOTA_TYPES:
                 if quota_type != "text" and quotas[quota_type].get("available", False):
-                    quotas[quota_type] = {
-                        "available": False,
-                        "reason": "对话配额受限"
-                    }
+                    quotas[quota_type]["available"] = False
+                    quotas[quota_type]["reason"] = "对话配额受限"
                     limited_count += 1
 
         return {
@@ -705,6 +797,7 @@ def load_multi_account_config(
             mail_client_id=acc.get("mail_client_id"),
             mail_refresh_token=acc.get("mail_refresh_token"),
             mail_tenant=acc.get("mail_tenant"),
+            trial_end=acc.get("trial_end"),
         )
 
         # 检查账户是否已过期（已过期也加载到管理面板）
@@ -722,6 +815,10 @@ def load_multi_account_config(
             account_mgr.conversation_count = int(acc.get("conversation_count", 0))
         if "failure_count" in acc:
             account_mgr.failure_count = int(acc.get("failure_count", 0))
+        if "daily_usage" in acc:
+            account_mgr.daily_usage = dict(acc["daily_usage"])
+        if "daily_usage_date" in acc:
+            account_mgr.daily_usage_date = str(acc.get("daily_usage_date", ""))
 
         if is_expired:
             manager.accounts[config.account_id].is_available = False
@@ -752,6 +849,8 @@ def reload_accounts(
             "last_error_time": account_mgr.last_error_time,
             "session_usage_count": account_mgr.session_usage_count,
             "quota_cooldowns": dict(account_mgr.quota_cooldowns),
+            "daily_usage": dict(account_mgr.daily_usage),
+            "daily_usage_date": account_mgr.daily_usage_date,
         }
 
     # Clear session cache and reload config.
@@ -774,6 +873,8 @@ def reload_accounts(
             account_mgr.last_error_time = stats.get("last_error_time", 0.0)
             account_mgr.session_usage_count = stats.get("session_usage_count", 0)
             account_mgr.quota_cooldowns = stats.get("quota_cooldowns", {})
+            account_mgr.daily_usage = stats.get("daily_usage", {"text": 0, "images": 0, "videos": 0})
+            account_mgr.daily_usage_date = stats.get("daily_usage_date", "")
             logger.debug(f"[CONFIG] Account {account_id} refreshed; runtime state preserved")
 
     logger.info(
@@ -992,6 +1093,8 @@ async def save_account_cooldown_state(account_id: str, account_mgr: AccountManag
             "quota_cooldowns": dict(account_mgr.quota_cooldowns),
             "conversation_count": account_mgr.conversation_count,
             "failure_count": account_mgr.failure_count,
+            "daily_usage": dict(account_mgr.daily_usage),
+            "daily_usage_date": account_mgr.daily_usage_date,
         }
 
         success = await storage.update_account_cooldown(account_id, cooldown_data)
@@ -1025,7 +1128,8 @@ async def save_all_cooldown_states(multi_account_mgr: MultiAccountManager) -> in
         has_cooldown = (
             account_mgr.quota_cooldowns or
             account_mgr.conversation_count > 0 or
-            account_mgr.failure_count > 0
+            account_mgr.failure_count > 0 or
+            any(v > 0 for v in account_mgr.daily_usage.values())
         )
 
         if has_cooldown:
@@ -1033,6 +1137,8 @@ async def save_all_cooldown_states(multi_account_mgr: MultiAccountManager) -> in
                 "quota_cooldowns": dict(account_mgr.quota_cooldowns),
                 "conversation_count": account_mgr.conversation_count,
                 "failure_count": account_mgr.failure_count,
+                "daily_usage": dict(account_mgr.daily_usage),
+                "daily_usage_date": account_mgr.daily_usage_date,
             }
             updates.append((account_id, cooldown_data))
 

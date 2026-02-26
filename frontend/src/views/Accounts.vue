@@ -256,12 +256,22 @@
           <div class="mt-4 grid grid-cols-2 gap-3 text-xs text-muted-foreground">
             <div>
               <p>状态</p>
-              <p class="mt-1 text-sm font-semibold text-foreground">
+              <p class="mt-1 flex flex-wrap items-center gap-1.5 text-sm font-semibold text-foreground">
                 <span
                   class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
                   :class="statusClass(account)"
                 >
                   {{ statusLabel(account) }}
+                </span>
+                <span
+                  v-if="account.trial_days_remaining != null"
+                  class="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs font-medium"
+                  :class="trialBadgeClass(account.trial_days_remaining)"
+                >
+                  <svg class="h-3 w-3 shrink-0" viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M5 1a1 1 0 0 1 1 1v.5h4V2a1 1 0 0 1 2 0v.5h1A1.5 1.5 0 0 1 14.5 4v9A1.5 1.5 0 0 1 13 14.5H3A1.5 1.5 0 0 1 1.5 13V4A1.5 1.5 0 0 1 3 2.5h1V2a1 1 0 0 1 1-1zm-2 4v1.5h10V5H3zm0 3v5h10V8H3z"/>
+                  </svg>
+                  {{ account.trial_days_remaining }}天
                 </span>
               </p>
             </div>
@@ -376,12 +386,24 @@
                 {{ account.id }}
               </td>
               <td class="py-4 pr-6">
-                <span
-                  class="inline-flex items-center rounded-full border border-border px-3 py-1 text-xs"
-                  :class="statusClass(account)"
-                >
-                  {{ statusLabel(account) }}
-                </span>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <span
+                    class="inline-flex items-center rounded-full border border-border px-3 py-1 text-xs"
+                    :class="statusClass(account)"
+                  >
+                    {{ statusLabel(account) }}
+                  </span>
+                  <span
+                    v-if="account.trial_days_remaining != null"
+                    class="inline-flex items-center gap-1 rounded-full border border-border px-2 py-1 text-xs font-medium"
+                    :class="trialBadgeClass(account.trial_days_remaining)"
+                  >
+                    <svg class="h-3 w-3 shrink-0" viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M5 1a1 1 0 0 1 1 1v.5h4V2a1 1 0 0 1 2 0v.5h1A1.5 1.5 0 0 1 14.5 4v9A1.5 1.5 0 0 1 13 14.5H3A1.5 1.5 0 0 1 1.5 13V4A1.5 1.5 0 0 1 3 2.5h1V2a1 1 0 0 1 1-1zm-2 4v1.5h10V5H3zm0 3v5h10V8H3z"/>
+                    </svg>
+                    {{ account.trial_days_remaining }}天
+                  </span>
+                </div>
               </td>
               <td class="py-4 pr-6">
                 <div class="text-sm font-semibold" :class="remainingClass(account)">
@@ -562,9 +584,6 @@
             </p>
             <p class="mt-1 text-muted-foreground">详细声明请查看项目 <a href="https://github.com/Dreamy-rain/gemini-business2api/blob/main/docs/DISCLAIMER.md" target="_blank" class="text-primary hover:underline font-medium">DISCLAIMER.md</a></p>
           </div>
-          <Checkbox v-model="registerAgreed">
-            我已阅读并同意上述说明与限制
-          </Checkbox>
           </div>
         </div>
 
@@ -581,7 +600,7 @@
               v-if="addMode === 'register'"
               class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
                      hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="isRegistering || !registerAgreed"
+              :disabled="isRegistering"
               @click="handleRegister"
             >
               开始注册
@@ -590,7 +609,7 @@
               v-else
               class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
                      hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="isImporting || !registerAgreed"
+              :disabled="isImporting"
               @click="handleImport"
             >
               导入并保存
@@ -1215,7 +1234,6 @@ const isLoadingHistory = ref(false)  // 加载历史记录状态
 type TaskLogLine = { time: string; level: string; message: string }
 const registerLogClearMarker = ref<TaskLogLine | null>(null)
 const loginLogClearMarker = ref<TaskLogLine | null>(null)
-const registerAgreed = ref(false)
 const registerTask = ref<RegisterTask | null>(null)
 const loginTask = ref<LoginTask | null>(null)
 const refreshingAccountIds = ref<Set<string>>(new Set())  // 正在刷新的账户ID集合（仅用于显示状态）
@@ -1603,7 +1621,6 @@ const openRegisterModal = () => {
   importError.value = ''
   isImporting.value = false
   importFileName.value = ''
-  registerAgreed.value = false
   // 重置为设置中的邮箱服务提供商
   selectedMailProvider.value = settings.value?.basic?.temp_mail_provider || defaultMailProvider
 }
@@ -1776,14 +1793,29 @@ const handleImportFile = async (event: Event) => {
     const content = await file.text()
     if (file.name.toLowerCase().endsWith('.json') || file.type.includes('json')) {
       const parsed = JSON.parse(content)
-      const list = Array.isArray(parsed) ? parsed : parsed?.accounts
-      if (!Array.isArray(list)) {
+      const importList = Array.isArray(parsed) ? parsed : parsed?.accounts
+      if (!Array.isArray(importList)) {
         importError.value = 'JSON 格式错误：需要数组或包含 accounts 字段'
         return
       }
-      await accountsStore.updateConfig(list)
-      selectedIds.value = new Set(list.map((item: any) => item.id).filter(Boolean))
-      toast.success(`导入 ${list.length} 条账号配置`)
+      const existing = await loadConfigList()
+      const next = [...existing]
+      const indexMap = new Map(next.map((acc, idx) => [acc.id, idx]))
+      const importedIds: string[] = []
+
+      importList.forEach((item: any) => {
+        const idx = indexMap.get(item.id || '')
+        if (idx === undefined) {
+          next.push(item)
+        } else {
+          next[idx] = { ...next[idx], ...item }
+        }
+        if (item.id) importedIds.push(item.id)
+      })
+
+      await accountsStore.updateConfig(next)
+      selectedIds.value = new Set(importedIds)
+      toast.success(`导入 ${importList.length} 条账号配置`)
       closeRegisterModal()
       return
     }
@@ -2283,6 +2315,13 @@ const remainingClass = (account: AdminAccount) => {
   if (account.status === '即将过期') return 'text-amber-700'
   if (account.status === '未设置') return 'text-muted-foreground'
   return 'text-emerald-600'
+}
+
+const trialBadgeClass = (days: number | null | undefined) => {
+  if (days == null) return ''
+  if (days > 7) return 'bg-emerald-500 text-white'
+  if (days >= 3) return 'bg-amber-500 text-white'
+  return 'bg-rose-500 text-white'
 }
 
 const rowClass = (account: AdminAccount) => {

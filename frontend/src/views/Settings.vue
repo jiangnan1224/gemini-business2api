@@ -64,27 +64,6 @@
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
                   placeholder="http://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1"
                 />
-                <div class="rounded-2xl border border-border/60 bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
-                  <p class="mb-2 font-medium">格式示例：</p>
-                  <div class="space-y-1.5">
-                    <div>
-                      <p class="text-[10px] text-muted-foreground/70 mb-0.5">基础格式：</p>
-                      <p class="font-mono text-[11px] leading-relaxed">http://127.0.0.1:7890</p>
-                    </div>
-                    <div>
-                      <p class="text-[10px] text-muted-foreground/70 mb-0.5">带认证：</p>
-                      <p class="font-mono text-[11px] leading-relaxed">http://user:pass@127.0.0.1:7890</p>
-                    </div>
-                    <div>
-                      <p class="text-[10px] text-muted-foreground/70 mb-0.5">SOCKS5 + NO_PROXY：</p>
-                      <p class="font-mono text-[11px] leading-relaxed break-all">socks5h://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1,.local</p>
-                    </div>
-                    <div>
-                      <p class="text-[10px] text-muted-foreground/70 mb-0.5">完整示例：</p>
-                      <p class="font-mono text-[11px] leading-relaxed break-all">socks5h://user:pass@127.0.0.1:7890 | no_proxy=localhost,127.0.0.1,.local</p>
-                    </div>
-                  </div>
-                </div>
               </div>
             </div>
 
@@ -252,7 +231,7 @@
                     class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
                     placeholder="X-API-Key"
                   />
-                  <label class="block text-xs text-muted-foreground">GPTMail 邮箱域名（可选）</label>
+                  <label class="block text-xs text-muted-foreground">GPTMail 邮箱域名（可选，不带@）</label>
                   <input
                     v-model="localSettings.basic.gptmail_domain"
                     type="text"
@@ -311,6 +290,46 @@
                   placement="up"
                   class="w-full"
                 />
+              </div>
+            </div>
+
+            <div class="rounded-2xl border border-border bg-card p-4">
+              <div class="flex items-center justify-between gap-2">
+                <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">每日配额</p>
+                <HelpTip text="基于 Google 官方限额的主动配额计数，达到上限后自动切换账号。0 表示不限制该类型。" />
+              </div>
+              <div class="mt-4 space-y-3">
+                <Checkbox v-model="localSettings.quota_limits.enabled">
+                  启用主动配额计数
+                </Checkbox>
+                <label class="block text-xs text-muted-foreground">对话每日上限</label>
+                <input
+                  v-model.number="localSettings.quota_limits.text_daily_limit"
+                  type="number"
+                  min="0"
+                  max="9999"
+                  class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="120"
+                />
+                <label class="block text-xs text-muted-foreground">绘图每日上限</label>
+                <input
+                  v-model.number="localSettings.quota_limits.images_daily_limit"
+                  type="number"
+                  min="0"
+                  max="9999"
+                  class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="2"
+                />
+                <label class="block text-xs text-muted-foreground">视频每日上限</label>
+                <input
+                  v-model.number="localSettings.quota_limits.videos_daily_limit"
+                  type="number"
+                  min="0"
+                  max="9999"
+                  class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="1"
+                />
+                <p class="text-xs text-muted-foreground">每日北京时间 16:00 重置（对齐 Google 太平洋时间午夜）</p>
               </div>
             </div>
 
@@ -414,8 +433,7 @@ const videosRateLimitCooldownHours = createCooldownHours(
 )
 
 const browserEngineOptions = [
-  { label: 'UC - 支持无头/有头', value: 'uc' },
-  { label: 'DP - 支持无头/有头（推荐）', value: 'dp' },
+  { label: 'DP - 支持无头/有头', value: 'dp' },
 ]
 const tempMailProviderOptions = mailProviderOptions
 const imageOutputOptions = [
@@ -430,6 +448,7 @@ const videoOutputOptions = [
 const imageModelOptions = computed(() => {
   const baseOptions = [
     { label: 'Gemini 3 Pro Preview', value: 'gemini-3-pro-preview' },
+    { label: 'Gemini 3.1 Pro Preview', value: 'gemini-3.1-pro-preview' },
     { label: 'Gemini 3 Flash Preview', value: 'gemini-3-flash-preview' },
     { label: 'Gemini 2.5 Pro', value: 'gemini-2.5-pro' },
     { label: 'Gemini 2.5 Flash', value: 'gemini-2.5-flash' },
@@ -499,6 +518,17 @@ watch(settings, (value) => {
   next.retry.auto_refresh_accounts_seconds = Number.isFinite(next.retry.auto_refresh_accounts_seconds)
     ? next.retry.auto_refresh_accounts_seconds
     : 60
+  next.quota_limits = next.quota_limits || {}
+  next.quota_limits.enabled = next.quota_limits.enabled ?? true
+  next.quota_limits.text_daily_limit = Number.isFinite(next.quota_limits.text_daily_limit)
+    ? next.quota_limits.text_daily_limit
+    : 120
+  next.quota_limits.images_daily_limit = Number.isFinite(next.quota_limits.images_daily_limit)
+    ? next.quota_limits.images_daily_limit
+    : 2
+  next.quota_limits.videos_daily_limit = Number.isFinite(next.quota_limits.videos_daily_limit)
+    ? next.quota_limits.videos_daily_limit
+    : 1
   localSettings.value = next
 })
 

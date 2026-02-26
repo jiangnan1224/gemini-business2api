@@ -1,11 +1,11 @@
 from typing import Callable, Optional
 
-from core.config import config
-from core.proxy_utils import extract_host, no_proxy_matches, parse_proxy_setting
-from core.duckmail_client import DuckMailClient
-from core.freemail_client import FreemailClient
-from core.gptmail_client import GPTMailClient
-from core.moemail_client import MoemailClient
+from worker.config import config
+from worker.proxy_utils import extract_host, no_proxy_matches, parse_proxy_setting
+from worker.mail_clients.duckmail_client import DuckMailClient
+from worker.mail_clients.freemail_client import FreemailClient
+from worker.mail_clients.gptmail_client import GPTMailClient
+from worker.mail_clients.moemail_client import MoemailClient
 
 
 def create_temp_mail_client(
